@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -6,7 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -94,6 +94,114 @@ REACTION_EMOJIS = {
 }
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
 
+# AI DISCLOSURE: the Assignment #1 code below (status levels, points, goals, pins,
+# contributions-needed list in feed()) was written with GitHub Copilot from prompts
+# in the project owner's chat, then reviewed and tested by the owner.
+# Design claim 23 (rewards): status levels earned through contribution points.
+# Each level is (min points, name, emoji, privilege unlocked at that level).
+STATUS_LEVELS = (
+    (0,   'Newcomer',    '',   'Post, comment and react'),
+    (40,  'Contributor', '🌱', 'A status badge next to your name that everyone can see'),
+    (150, 'Active',      '🔥', 'Pin one of your posts to the top of your profile'),
+    (400, 'Champion',    '🏆', 'Pin up to three posts on your profile'),
+    (800, 'Legend',      '👑', 'Pin up to five posts and get a gold badge'),
+    (1500, 'Icon',       '💎', 'Maximum level: your posts get a gold edge in the feed'),
+)
+PIN_LIMIT_BY_LEVEL = {2: 1, 3: 3, 4: 5, 5: 5}
+HIGHLIGHT_MIN_LEVEL = 5  # only the maximum level gets highlighted posts
+GOLD_BADGE_MIN_LEVEL = 4
+
+# Points per action. Engagement received from *other* members is worth more than
+# activity you do yourself, which makes farming points on your own posts useless.
+POINTS_POST = 5
+POINTS_COMMENT_ON_OTHERS_POST = 3
+POINTS_REACTION_GIVEN = 1
+POINTS_REACTION_RECEIVED = 2
+POINTS_COMMENT_RECEIVED = 2
+
+
+# AI-assisted (Copilot): ensure_contribution_tables, get_user_status, user_status,
+# week_start_for, set_contribution_goal, toggle_pin, and the Assignment #1 parts of
+# feed(), user_profile() and delete_post(). `abort` import fix was also AI-suggested.
+def ensure_contribution_tables():
+    """Create the tables used for weekly goals and pinned posts."""
+    db = get_db()
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS contribution_goals (
+            user_id INTEGER PRIMARY KEY,
+            target_count INTEGER NOT NULL CHECK (target_count BETWEEN 1 AND 50),
+            week_start TEXT NOT NULL
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS pinned_posts (
+            user_id INTEGER NOT NULL,
+            post_id INTEGER NOT NULL,
+            PRIMARY KEY (user_id, post_id)
+        )
+    ''')
+    db.commit()
+
+
+def get_user_status(username):
+    """
+    Work out a member's points, status level and unlocked privileges.
+    Results are cached for the length of the request because the badge is
+    rendered next to every username on a page.
+    """
+    cache = g.setdefault('status_cache', {})
+    if username in cache:
+        return cache[username]
+
+    row = query_db('''
+        SELECT u.id,
+            (SELECT COUNT(*) FROM posts WHERE user_id = u.id) AS posts,
+            (SELECT COUNT(*) FROM comments c JOIN posts p ON p.id = c.post_id
+                WHERE c.user_id = u.id AND p.user_id != u.id) AS comments,
+            (SELECT COUNT(*) FROM reactions WHERE user_id = u.id) AS reactions_given,
+            (SELECT COUNT(*) FROM reactions r JOIN posts p ON p.id = r.post_id
+                WHERE p.user_id = u.id AND r.user_id != u.id) AS reactions_received,
+            (SELECT COUNT(*) FROM comments c JOIN posts p ON p.id = c.post_id
+                WHERE p.user_id = u.id AND c.user_id != u.id) AS comments_received
+        FROM users u WHERE u.username = ?
+    ''', (username,), one=True)
+
+    points = 0
+    if row:
+        points = (row['posts'] * POINTS_POST
+                  + row['comments'] * POINTS_COMMENT_ON_OTHERS_POST
+                  + row['reactions_given'] * POINTS_REACTION_GIVEN
+                  + row['reactions_received'] * POINTS_REACTION_RECEIVED
+                  + row['comments_received'] * POINTS_COMMENT_RECEIVED)
+
+    level = max(i for i, lvl in enumerate(STATUS_LEVELS) if points >= lvl[0])
+    next_level = STATUS_LEVELS[level + 1] if level + 1 < len(STATUS_LEVELS) else None
+    status = {
+        'points': points,
+        'level': level,
+        'name': STATUS_LEVELS[level][1],
+        'emoji': STATUS_LEVELS[level][2],
+        'next_name': next_level[1] if next_level else None,
+        'next_points': next_level[0] if next_level else None,
+        'next_privilege': next_level[3] if next_level else None,
+        'pin_limit': PIN_LIMIT_BY_LEVEL.get(level, 0),
+        'highlighted': level >= HIGHLIGHT_MIN_LEVEL,
+        'gold': level >= GOLD_BADGE_MIN_LEVEL,
+    }
+    cache[username] = status
+    return status
+
+
+@app.template_global()
+def user_status(username):
+    """Expose a member's status to templates so badges show up everywhere."""
+    return get_user_status(username)
+
+
+def week_start_for(date):
+    """Return the Monday that starts the week containing date."""
+    return date - timedelta(days=date.weekday())
+
 
 @app.route('/')
 def feed():
@@ -111,6 +219,117 @@ def feed():
 
     current_user_id = session.get('user_id')
     params = []
+    contribution_tasks = []
+    contribution_goal = None
+    goal_progress = 0
+    goal_progress_percent = 0
+    suggested_goal = 5
+    my_status = None
+
+    if current_user_id:
+        ensure_contribution_tables()
+        db = get_db()
+        today = datetime.utcnow().date()
+        this_week = week_start_for(today)
+        last_week = this_week - timedelta(days=7)
+        week_start_text = this_week.strftime('%Y-%m-%d 00:00:00')
+        last_week_start_text = last_week.strftime('%Y-%m-%d 00:00:00')
+
+        prior_posts = query_db(
+            'SELECT COUNT(*) AS count FROM posts WHERE user_id = ? AND created_at >= ? AND created_at < ?',
+            (current_user_id, last_week_start_text, week_start_text),
+            one=True
+        )['count']
+        prior_comments = query_db(
+            'SELECT COUNT(*) AS count FROM comments WHERE user_id = ? AND created_at >= ? AND created_at < ?',
+            (current_user_id, last_week_start_text, week_start_text),
+            one=True
+        )['count']
+        previous_week_contributions = prior_posts + prior_comments
+        suggested_goal = min(
+            50,
+            max(5, previous_week_contributions + max(3, (previous_week_contributions + 1) // 2))
+        )
+
+        goal = query_db(
+            'SELECT target_count, week_start FROM contribution_goals WHERE user_id = ?',
+            (current_user_id,),
+            one=True
+        )
+        if goal and goal['week_start'] != this_week.isoformat():
+            db.execute(
+                'UPDATE contribution_goals SET week_start = ? WHERE user_id = ?',
+                (this_week.isoformat(), current_user_id)
+            )
+            db.commit()
+        contribution_goal = goal['target_count'] if goal else suggested_goal
+
+        current_posts = query_db(
+            'SELECT COUNT(*) AS count FROM posts WHERE user_id = ? AND created_at >= ?',
+            (current_user_id, week_start_text),
+            one=True
+        )['count']
+        current_comments = query_db(
+            'SELECT COUNT(*) AS count FROM comments WHERE user_id = ? AND created_at >= ?',
+            (current_user_id, week_start_text),
+            one=True
+        )['count']
+        goal_progress = current_posts + current_comments
+        goal_progress_percent = min(100, int(goal_progress * 100 / contribution_goal))
+
+        contributions = query_db('''
+            WITH eligible_posts AS (
+                SELECT p.id, p.content, p.created_at, u.username,
+                       u.id AS user_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY u.id
+                           ORDER BY p.created_at DESC, p.id DESC
+                       ) AS post_rank
+                FROM posts p
+                JOIN users u ON u.id = p.user_id
+                JOIN follows f ON f.followed_id = u.id
+                WHERE f.follower_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reactions r
+                      WHERE r.post_id = p.id AND r.user_id = ?
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM comments c
+                      WHERE c.post_id = p.id AND c.user_id = ?
+                  )
+            ),
+            followed_interactions AS (
+                SELECT f.followed_id,
+                    (SELECT COUNT(*)
+                     FROM comments c
+                     JOIN posts p ON p.id = c.post_id
+                     WHERE (c.user_id = ? AND p.user_id = f.followed_id)
+                        OR (c.user_id = f.followed_id AND p.user_id = ?))
+                    +
+                    (SELECT COUNT(*)
+                     FROM reactions r
+                     JOIN posts p ON p.id = r.post_id
+                     WHERE (r.user_id = ? AND p.user_id = f.followed_id)
+                        OR (r.user_id = f.followed_id AND p.user_id = ?))
+                    AS interaction_count
+                FROM follows f
+                WHERE f.follower_id = ?
+            )
+            SELECT ep.id, ep.content, ep.created_at, ep.username, ep.user_id
+            FROM eligible_posts ep
+            JOIN followed_interactions fi ON fi.followed_id = ep.user_id
+            WHERE ep.post_rank = 1
+            ORDER BY fi.interaction_count ASC, ep.created_at DESC
+            LIMIT 3
+        ''', (current_user_id, current_user_id, current_user_id,
+              current_user_id, current_user_id, current_user_id, current_user_id,
+              current_user_id))
+        for contribution in contributions:
+            contribution = dict(contribution)
+            contribution['content'], _ = moderate_content(contribution['content'])
+            contribution_tasks.append(contribution)
+
+        my_status = get_user_status(session.get('username'))
 
     #  2. Build the Query 
     where_clause = ""
@@ -188,6 +407,7 @@ def feed():
             'reactions': reactions,
             'user_reaction': user_reaction,
             'followed_poster': followed_poster,
+            'highlighted': get_user_status(post['username'])['highlighted'],
             'comments': comments_moderated
         })
 
@@ -199,7 +419,47 @@ def feed():
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           contribution_tasks=contribution_tasks,
+                           contribution_goal=contribution_goal,
+                           goal_progress=goal_progress,
+                           goal_progress_percent=goal_progress_percent,
+                           suggested_goal=suggested_goal,
+                           my_status=my_status,
+                           status_levels=STATUS_LEVELS)
+
+
+@app.route('/contribution-goal', methods=['POST'])
+def set_contribution_goal():
+    """Save a member-selected weekly contribution target."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to set a contribution goal.', 'danger')
+        return redirect(url_for('login'))
+
+    try:
+        target_count = int(request.form.get('target_count', ''))
+    except ValueError:
+        flash('Choose a weekly goal between 1 and 50 contributions.', 'warning')
+        return redirect(url_for('feed'))
+
+    if not 1 <= target_count <= 50:
+        flash('Choose a weekly goal between 1 and 50 contributions.', 'warning')
+        return redirect(url_for('feed'))
+
+    ensure_contribution_tables()
+    week_start = week_start_for(datetime.utcnow().date()).isoformat()
+    db = get_db()
+    db.execute('''
+        INSERT INTO contribution_goals (user_id, target_count, week_start)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            target_count = excluded.target_count,
+            week_start = excluded.week_start
+    ''', (user_id, target_count, week_start))
+    db.commit()
+    flash(f'Your weekly contribution goal is now {target_count}.', 'success')
+    return redirect(url_for('feed'))
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -260,6 +520,8 @@ def delete_post(post_id):
     # To maintain database integrity, delete associated records first
     db.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
     db.execute('DELETE FROM reactions WHERE post_id = ?', (post_id,))
+    ensure_contribution_tables()
+    db.execute('DELETE FROM pinned_posts WHERE post_id = ?', (post_id,))
     # Finally, delete the post itself
     db.execute('DELETE FROM posts WHERE id = ?', (post_id,))
     db.commit()
@@ -314,13 +576,61 @@ def user_profile(username):
             is_currently_following = True
     # --
 
+    # Pinned posts (a privilege of higher status levels) are listed first on the profile
+    ensure_contribution_tables()
+    pinned_ids = {row['post_id'] for row in query_db(
+        'SELECT post_id FROM pinned_posts WHERE user_id = ?', (user['id'],))}
+    posts.sort(key=lambda p: p['id'] not in pinned_ids)
+    status = get_user_status(user['username'])
+
     return render_template('user_profile.html.j2', 
                            user=user, 
                            posts=posts, 
                            comments=comments,
                            followers_count=followers_count, 
                            following_count=following_count,
-                           is_following=is_currently_following)
+                           is_following=is_currently_following,
+                           pinned_ids=pinned_ids,
+                           status=status)
+
+
+@app.route('/posts/<int:post_id>/pin', methods=['POST'])
+def toggle_pin(post_id):
+    """Pin or unpin one of your own posts; the number of pins depends on your status level."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to pin a post.', 'danger')
+        return redirect(url_for('login'))
+
+    post = query_db('SELECT id, user_id FROM posts WHERE id = ?', (post_id,), one=True)
+    if not post or post['user_id'] != user_id:
+        flash('You can only pin your own posts.', 'danger')
+        return redirect(request.referrer or url_for('feed'))
+
+    ensure_contribution_tables()
+    db = get_db()
+    already_pinned = query_db(
+        'SELECT 1 FROM pinned_posts WHERE user_id = ? AND post_id = ?',
+        (user_id, post_id), one=True)
+
+    if already_pinned:
+        db.execute('DELETE FROM pinned_posts WHERE user_id = ? AND post_id = ?', (user_id, post_id))
+        db.commit()
+        flash('Post unpinned.', 'success')
+    else:
+        pin_limit = get_user_status(session.get('username'))['pin_limit']
+        pinned_count = query_db(
+            'SELECT COUNT(*) AS count FROM pinned_posts WHERE user_id = ?',
+            (user_id,), one=True)['count']
+        if pin_limit == 0:
+            flash('Reach the Active level to unlock pinned posts.', 'warning')
+        elif pinned_count >= pin_limit:
+            flash(f'You can pin up to {pin_limit} post(s) at your level. Unpin one first.', 'warning')
+        else:
+            db.execute('INSERT INTO pinned_posts (user_id, post_id) VALUES (?, ?)', (user_id, post_id))
+            db.commit()
+            flash('Post pinned to your profile.', 'success')
+    return redirect(request.referrer or url_for('feed'))
     
 
 @app.route('/u/<username>/followers')
@@ -940,4 +1250,3 @@ def recommend(user_id, filter_following):
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
-

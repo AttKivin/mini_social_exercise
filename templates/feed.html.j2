@@ -20,6 +20,73 @@
     </div>
   </div>
 </div>
+
+<section class="col-md-8 mx-auto mb-4" aria-labelledby="community-hub-heading">
+  <div class="card">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="card-title mb-0" id="community-hub-heading">Weekly goal</h5>
+        <button class="btn btn-light btn-sm" type="button" data-bs-toggle="collapse" data-bs-target="#status-levels" aria-expanded="false" aria-controls="status-levels" title="Post +5, comment on others' posts +3, reaction given +1, reaction or comment received +2">
+          {% if my_status.emoji %}{{ my_status.emoji }} {% endif %}{{ my_status.name }} · {{ my_status.points }} pts
+        </button>
+      </div>
+
+      <div class="d-flex align-items-center gap-3 mt-3">
+        <div class="progress flex-grow-1" style="height: 1.1rem;" role="progressbar" aria-label="Weekly contribution goal progress" aria-valuenow="{{ goal_progress_percent }}" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar" style="width: {{ goal_progress_percent }}%"></div>
+        </div>
+        <span class="text-nowrap"><strong>{{ goal_progress }}</strong> / {{ contribution_goal }}</span>
+        <button class="btn btn-light btn-sm" type="button" data-bs-toggle="collapse" data-bs-target="#goal-settings" aria-expanded="false" aria-controls="goal-settings">Edit goal</button>
+      </div>
+      <small class="text-muted d-block mt-1">
+        Posts and comments count toward your goal.
+        {% if my_status.next_name %}Next: <strong>{{ my_status.next_name }}</strong> in {{ my_status.next_points - my_status.points }} pts unlocks "{{ my_status.next_privilege|lower }}".{% else %}You have reached the highest status!{% endif %}
+      </small>
+
+      <div class="collapse" id="status-levels">
+        <hr>
+        <h6>Status levels</h6>
+        <ul class="list-unstyled mb-2 small">
+          {% for min_points, name, emoji, privilege in status_levels %}
+          <li class="{% if name == my_status.name %}fw-bold{% endif %}">{{ emoji }} {{ name }} ({{ min_points }}+ pts): {{ privilege }}</li>
+          {% endfor %}
+        </ul>
+        <small class="text-muted">Points: post +5, comment on someone else's post +3, reaction given +1, reaction or comment you receive from others +2.</small>
+      </div>
+
+      <div class="collapse" id="goal-settings">
+        <form action="{{ url_for('set_contribution_goal') }}" method="POST" class="d-flex align-items-center gap-2 mt-3">
+          <label for="target-count" class="mb-0">Contributions per week</label>
+          <input class="form-control form-control-sm" style="width: 5rem;" id="target-count" name="target_count" type="number" min="1" max="50" value="{{ contribution_goal }}" required>
+          <button class="btn btn-primary btn-sm" type="submit">Save</button>
+        </form>
+        <form action="{{ url_for('set_contribution_goal') }}" method="POST" class="mt-2">
+          <input type="hidden" name="target_count" value="{{ suggested_goal }}">
+          <button class="btn btn-light btn-sm" type="submit">Take the suggested challenge: {{ suggested_goal }}</button>
+        </form>
+      </div>
+
+      <hr>
+      <h6 class="mb-0" id="contributions-needed-heading">Waiting for your reply</h6>
+      <small class="text-muted">One recent post per person; people with fewer past interactions appear first.</small>
+      <ul class="list-group list-group-flush shadow-none border-0">
+        {% for task in contribution_tasks %}
+        <li class="card shadow-none p-2 mt-2">
+          <div class="d-flex justify-content-between align-items-center gap-2">
+            <div class="text-truncate">
+              <strong>{{ user_display(task.username) }}</strong>
+              <p class="mb-0 text-truncate">{{ task.content }}</p>
+            </div>
+            <a href="{{ url_for('post_detail', post_id=task.id) }}" class="btn btn-primary btn-sm">Reply</a>
+          </div>
+        </li>
+        {% else %}
+        <li class="text-muted mt-2">You are all caught up with the people you follow.</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</section>
 {% endif %}
 
 <h2 class="text-center border-bottom pb-2 mb-4"><span>Posts</span></h2>
@@ -49,7 +116,7 @@
 
 <div class="col-md-8 mx-auto">
   {% for entry in posts %}
-  <div class="card mb-4" id="post-{{ entry.post.id }}">
+  <div class="card mb-4" id="post-{{ entry.post.id }}"{% if entry.highlighted %} style="border-left: 4px solid #d4a017;"{% endif %}>
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center">
         <h3 class="card-title mb-0">

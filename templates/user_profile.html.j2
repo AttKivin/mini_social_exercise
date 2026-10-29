@@ -16,6 +16,10 @@
             <strong>Joined:</strong> {{ user.created_at|datetimeformat }}
           </p>
           <p class="card-text">{{ user.profile or "No profile information provided." }}</p>
+          <p class="card-text">
+            <strong>Status:</strong> {% if status.emoji %}{{ status.emoji }} {% endif %}{{ status.name }} · {{ status.points }} points
+            {% if status.next_name %}<small class="text-muted">({{ status.next_points - status.points }} pts to {{ status.next_name }})</small>{% endif %}
+          </p>
 
          {% if session.user_id and session.user_id != user.id %}
             <div class="my-3">
@@ -57,10 +61,17 @@
       <div class="card h-100 shadow-sm card-hover">
         <a href="{{ url_for('post_detail', post_id=post.id) }}" class="text-decoration-none text-reset">
           <div class="card-body">
+            {% if post.id in pinned_ids %}<small class="text-muted d-block mb-1">📌 Pinned</small>{% endif %}
             <p class="card-text">{{ post.content|truncate(100, True, '...') }}</p>
             <small class="text-muted">Posted on {{ post.created_at|datetimeformat }}</small>
           </div>
         </a>
+        {# Pinning is a status privilege and is only offered on your own posts #}
+        {% if session.user_id == user.id and (post.id in pinned_ids or status.pin_limit > 0) %}
+        <form action="{{ url_for('toggle_pin', post_id=post.id) }}" method="POST" class="px-3 pb-3">
+          <button type="submit" class="btn btn-sm btn-light">{% if post.id in pinned_ids %}Unpin{% else %}Pin to profile{% endif %}</button>
+        </form>
+        {% endif %}
       </div>
     </div>
     {% else %}

@@ -6,4 +6,8 @@
     </svg>
     <span>@{{ user_id }}</span>
   </a>
+  {% set status = user_status(user_id) %}
+  {% if status.emoji %}
+  <span class="badge {{ 'text-bg-warning' if status.gold else 'text-bg-light border' }} align-middle" style="font-size: 0.6em;" title="{{ status.name }} · {{ status.points }} points">{{ status.emoji }} {{ status.name }}</span>
+  {% endif %}
 {% endmacro %}
