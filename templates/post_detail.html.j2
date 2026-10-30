@@ -112,7 +112,10 @@
         <form action="/posts/{{ post.id }}/comment" method="POST">
           <div class="mb-3">
             <label for="comment-content-{{ post.id }}" class="form-label">Your Comment</label>
-            <textarea class="form-control" id="comment-content-{{ post.id }}" name="content" rows="3" data-moderation-check required></textarea>
+            {% if author_is_newcomer %}
+            <div class="alert alert-info py-1 px-2 small">🌱 This member is new here, please be kind and welcoming.</div>
+            {% endif %}
+            <textarea class="form-control" id="comment-content-{{ post.id }}" name="content" rows="3" data-moderation-check{% if author_is_newcomer %} data-newcomer="1"{% endif %} required></textarea>
             <small class="text-muted">Remember the <a href="/rules">community rules</a>: no profanity, spam, external links or excessive caps.</small>
           </div>
           <button type="submit" class="btn btn-primary">Submit Comment</button>

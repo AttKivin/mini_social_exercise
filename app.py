@@ -203,6 +203,18 @@ def week_start_for(date):
     return date - timedelta(days=date.weekday())
 
 
+# Design Claim 18 (Chapter 5): friendly interactions soon after joining help
+# newcomers stay and contribute. Accounts younger than this are "newcomers".
+NEWCOMER_DAYS = 7
+
+
+def is_newcomer(created_at):
+    """True if the account was created less than NEWCOMER_DAYS ago."""
+    if isinstance(created_at, str):
+        created_at = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+    return (datetime.utcnow() - created_at).days < NEWCOMER_DAYS
+
+
 @app.route('/')
 def feed():
     #  1. Get Pagination and Filter Parameters 
@@ -225,6 +237,7 @@ def feed():
     goal_progress_percent = 0
     suggested_goal = 5
     my_status = None
+    newcomer_posts = []
 
     if current_user_id:
         ensure_contribution_tables()
@@ -331,6 +344,21 @@ def feed():
 
         my_status = get_user_status(session.get('username'))
 
+        # Design Claim 18: surface newcomers' latest posts so existing members
+        # can welcome them with a reaction or comment soon after they joined.
+        newcomer_posts = query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+            FROM posts p
+            JOIN users u ON u.id = p.user_id
+            WHERE u.created_at >= datetime('now', ?)
+              AND p.user_id != ?
+            ORDER BY p.created_at DESC
+            LIMIT 3
+        ''', (f'-{NEWCOMER_DAYS} days', current_user_id))
+        newcomer_posts = [dict(p) for p in newcomer_posts]
+        for p in newcomer_posts:
+            p['content'], _ = moderate_content(p['content'])
+
     #  2. Build the Query 
     where_clause = ""
     if show == 'following' and current_user_id:
@@ -426,7 +454,8 @@ def feed():
                            goal_progress_percent=goal_progress_percent,
                            suggested_goal=suggested_goal,
                            my_status=my_status,
-                           status_levels=STATUS_LEVELS)
+                           status_levels=STATUS_LEVELS,
+                           newcomer_posts=newcomer_posts)
 
 
 @app.route('/contribution-goal', methods=['POST'])
@@ -664,7 +693,7 @@ def post_detail(post_id):
     """Displays a single post and its comments, with content moderation applied."""
     
     post_raw = query_db('''
-        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id, u.created_at as author_created_at
         FROM posts p
         JOIN users u ON p.user_id = u.id
         WHERE p.id = ?
@@ -707,7 +736,8 @@ def post_detail(post_id):
                            reactions=reactions,
                            comments=comments,
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           author_is_newcomer=is_newcomer(post['author_created_at']))
 
 @app.route('/about')
 def about():
@@ -801,6 +831,19 @@ def add_comment(post_id):
 
     # Get content from the submitted form
     content = request.form.get('content')
+
+    # Design Claim 21 (Chapter 5): discourage hostility toward newcomers.
+    # Hostile comments on a newcomer's post are blocked and must be reworded,
+    # following the "reword rather than revert" norm.
+    post_author = query_db('''
+        SELECT u.id, u.created_at FROM posts p
+        JOIN users u ON u.id = p.user_id WHERE p.id = ?
+    ''', (post_id,), one=True)
+    if post_author and is_newcomer(post_author['created_at']) and post_author['id'] != user_id:
+        _, hostility = moderate_content(content or '')
+        if hostility >= 2.0:
+            flash('This member is new here. Your comment looks unfriendly, please reword it kindly.', 'warning')
+            return redirect(request.referrer or url_for('post_detail', post_id=post_id))
 
     # Basic validation to ensure comment is not empty
     if content and content.strip():
@@ -1184,6 +1227,16 @@ def moderation_check():
         category, message = 'warning', 'Excessive capitalization may be flagged as shouting.'
     else:
         category, message = 'ok', ''
+
+    # Design Claim 21 (Chapter 5): discourage hostility toward newcomers.
+    # When replying to a newcomer's post, borderline text gets an extra reminder
+    # and clearly hostile text is marked as blocked.
+    if request.form.get('newcomer') == '1':
+        if category == 'danger':
+            message += ' This comment will be blocked because the author is new here.'
+        elif category != 'ok':
+            message += ' Please be extra kind, this member is new here.'
+
     return {'category': category, 'message': message}
 
 @app.template_global()
@@ -1319,9 +1372,86 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    if not user_id:
+        return []
 
-    return recommended_posts;
+    # Positive reactions tell us what content the user likes.
+    POSITIVE_REACTIONS = ('like', 'love', 'laugh', 'wow')
+
+    # Step 1: collect the user's interest signals.
+    # - Authors of posts the user reacted positively to (weight 5)
+    # - Users the user follows (weight 2)
+    # - Words from positively reacted posts, for content matching (weight 1)
+    author_scores = collections.Counter()
+    for row in query_db('''
+        SELECT p.user_id FROM reactions r
+        JOIN posts p ON p.id = r.post_id
+        WHERE r.user_id = ? AND r.reaction_type IN ('like', 'love', 'laugh', 'wow')
+    ''', (user_id,)):
+        author_scores[row['user_id']] += 5
+    for row in query_db('SELECT followed_id FROM follows WHERE follower_id = ?', (user_id,)):
+        author_scores[row['followed_id']] += 2
+
+    interest_words = collections.Counter()
+    for row in query_db('''
+        SELECT p.content FROM reactions r
+        JOIN posts p ON p.id = r.post_id
+        WHERE r.user_id = ? AND r.reaction_type IN ('like', 'love', 'laugh', 'wow')
+    ''', (user_id,)):
+        for word in re.findall(r"[a-zA-Z']+", row['content'].lower()):
+            if len(word) > 4:  # skip short filler words
+                interest_words[word] += 1
+
+    # Step 2: score candidate posts the user has not written or reacted to yet.
+    if filter_following:
+        candidates = query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p JOIN users u ON p.user_id = u.id
+            WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)
+              AND p.user_id != ?
+        ''', (user_id, user_id))
+    else:
+        candidates = query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ?
+        ''', (user_id,))
+
+    reacted_ids = {row['post_id'] for row in query_db(
+        'SELECT post_id FROM reactions WHERE user_id = ?', (user_id,))}
+
+    scored = []
+    for post in candidates:
+        if post['id'] in reacted_ids:
+            continue  # already seen/reacted
+        score = author_scores.get(post['user_id'], 0)
+        for word in re.findall(r"[a-zA-Z']+", post['content'].lower()):
+            score += interest_words.get(word, 0)
+        if score > 0:
+            scored.append((score, post))
+
+    # Step 3: return the 5 best posts, best score first, newest first on ties.
+    # Prefer at most 2 posts per author for variety; if that leaves fewer
+    # than 5, fill the rest with the remaining best-scoring posts.
+    scored.sort(key=lambda item: (item[0], item[1]['created_at']), reverse=True)
+    recommended_posts = []
+    author_counts = collections.Counter()
+    for _, post in scored:
+        if author_counts[post['user_id']] >= 2:
+            continue
+        author_counts[post['user_id']] += 1
+        recommended_posts.append(post)
+        if len(recommended_posts) == 5:
+            break
+    if len(recommended_posts) < 5:
+        chosen_ids = {p['id'] for p in recommended_posts}
+        for _, post in scored:
+            if post['id'] in chosen_ids:
+                continue
+            recommended_posts.append(post)
+            if len(recommended_posts) == 5:
+                break
+    return recommended_posts
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)

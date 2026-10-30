@@ -85,6 +85,25 @@
         <li class="text-muted mt-2">You are all caught up with the people you follow.</li>
         {% endfor %}
       </ul>
+
+      {% if newcomer_posts %}
+      <hr>
+      <h6 class="mb-0">Say hi to new members</h6>
+      <small class="text-muted">These members joined in the last week. A quick reaction or comment helps them stay.</small>
+      <ul class="list-group list-group-flush shadow-none border-0">
+        {% for np in newcomer_posts %}
+        <li class="card shadow-none p-2 mt-2">
+          <div class="d-flex justify-content-between align-items-center gap-2">
+            <div class="text-truncate">
+              <strong>{{ user_display(np.username) }}</strong> <span class="badge text-bg-success">New member</span>
+              <p class="mb-0 text-truncate">{{ np.content }}</p>
+            </div>
+            <a href="{{ url_for('post_detail', post_id=np.id) }}" class="btn btn-success btn-sm">Say hi</a>
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
     </div>
   </div>
 </section>

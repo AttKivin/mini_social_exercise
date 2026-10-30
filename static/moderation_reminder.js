@@ -19,9 +19,11 @@ document.addEventListener('DOMContentLoaded', () => {
           return;
         }
         try {
+          const body = new URLSearchParams({ content: text });
+          if (textarea.dataset.newcomer === '1') body.append('newcomer', '1');
           const res = await fetch('/moderation/check', {
             method: 'POST',
-            body: new URLSearchParams({ content: text }),
+            body: body,
           });
           const data = await res.json();
           if (data.category === 'ok') {
