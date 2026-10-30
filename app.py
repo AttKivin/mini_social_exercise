@@ -1166,6 +1166,26 @@ def admin_delete_comment(comment_id):
 def rules():
     return render_template('rules.html.j2')
 
+
+# Design Claim 20 (Chapter 4): reminders at the point of action reduce offenses.
+# This endpoint lets the post/comment forms check draft text against the
+# moderation rules while the user is still typing, before anything is submitted.
+@app.route('/moderation/check', methods=['POST'])
+def moderation_check():
+    content = request.form.get('content', '')
+    moderated, score = moderate_content(content)
+    if moderated == '[content removed due to severe violation]':
+        category, message = 'danger', 'This text contains a severe rule violation and will be removed if posted.'
+    elif moderated == '[content removed due to spam/scam policy]':
+        category, message = 'danger', 'This text looks like spam or a scam and will be removed if posted.'
+    elif moderated != content:
+        category, message = 'warning', 'Parts of this text break the community rules and will be censored (mild profanity or links).'
+    elif score > 0:
+        category, message = 'warning', 'Excessive capitalization may be flagged as shouting.'
+    else:
+        category, message = 'ok', ''
+    return {'category': category, 'message': message}
+
 @app.template_global()
 def loop_color(user_id):
     # Generate a pastel color based on user_id hash
@@ -1194,9 +1214,37 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
     
-    score = 0
+    user = query_db('SELECT profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user:
+        return 0.0
 
-    return score;
+    # Step 1: score the profile text
+    _, profile_score = moderate_content(user['profile'] or '')
+
+    # Steps 2-3: average content score of the user's posts and comments
+    posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    post_scores = [moderate_content(p['content'])[1] for p in posts]
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0.0
+
+    comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    comment_scores = [moderate_content(c['content'])[1] for c in comments]
+    average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+
+    # Step 4: weighted combination (posts weigh most)
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    # Step 5: newer accounts are riskier
+    created_at = user['created_at']
+    if isinstance(created_at, str):
+        created_at = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+    account_age_days = (datetime.utcnow() - created_at).days
+    if account_age_days < 7:
+        content_risk_score *= 1.5
+    elif account_age_days < 30:
+        content_risk_score *= 1.2
+
+    # Step 6: cap at 5.0
+    return min(5.0, content_risk_score)
 
     
 # Assignment 2.1
@@ -1217,9 +1265,36 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
+    if not content:
+        return content, 0.0
+
+    # Stage 1.1: severe violations remove the whole content immediately
+    for word in TIER1_WORDS:
+        if re.search(r'\b' + re.escape(word) + r'\b', content, re.IGNORECASE):
+            return '[content removed due to severe violation]', 5.0
+    for phrase in TIER2_PHRASES:
+        if re.search(r'\b' + re.escape(phrase) + r'\b', content, re.IGNORECASE):
+            return '[content removed due to spam/scam policy]', 5.0
+
     moderated_content = content
-    score = 0
-    
+    score = 0.0
+
+    # Rule 1.2.1: mask Tier 3 words with asterisks, +2.0 each
+    for word in TIER3_WORDS:
+        pattern = re.compile(r'\b(' + re.escape(word) + r')\b', re.IGNORECASE)
+        moderated_content, count = pattern.subn(lambda m: '*' * len(m.group(1)), moderated_content)
+        score += count * 2.0
+
+    # Rule 1.2.2: replace URLs, +2.0 each
+    url_pattern = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
+    moderated_content, count = url_pattern.subn('[link removed]', moderated_content)
+    score += count * 2.0
+
+    # Rule 1.2.3: excessive capitalization, +0.5 (content unchanged)
+    letters = [c for c in content if c.isalpha()]
+    if len(letters) > 15 and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7:
+        score += 0.5
+
     return moderated_content, score
 
 # Coding Assignment #3

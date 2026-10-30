@@ -13,7 +13,8 @@
       <h5 class="card-title">Create a new post</h5>
       <form action="{{ url_for('add_post') }}" method="POST">
         <div class="mb-3">
-          <textarea class="form-control" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required></textarea>
+          <textarea class="form-control" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" data-moderation-check required></textarea>
+          <small class="text-muted">Remember the <a href="/rules">community rules</a>: no profanity, spam, external links or excessive caps.</small>
         </div>
         <button type="submit" class="btn btn-primary float-end">Post</button>
       </form>
